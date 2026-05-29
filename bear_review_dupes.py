@@ -677,9 +677,11 @@ def run(stdscr, pairs):
                 flash(stdscr, " bearcli failed — is it installed? ", C_DIFF)
 
         elif key == ord('s'):
-            # sync tags from the copy into the base (union: add the ones it lacks)
+            # sync tags from the copy into the base (union: add the ones it lacks).
+            # Consider tags from both sources — a tag in the copy's markdown but
+            # not yet indexed in the DB still needs to be transferred.
             base, sfx, _ = pairs[idx]
-            missing = sfx["db_tags"] - base["db_tags"]
+            missing = (sfx["db_tags"] | sfx["md_tags"]) - (base["db_tags"] | base["md_tags"])
             if not missing:
                 flash(stdscr, " base already has all of the copy's tags ", C_HILITE)
             elif add_tags(base["id"], missing):
