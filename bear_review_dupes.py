@@ -518,8 +518,10 @@ def draw_meta(stdscr, x, y, w, note, other, only_here_style):
         return segs
 
     def date_segs(label, field):
-        attr = style_attr(only_here_style) if note[field] != other[field] else curses.A_DIM
-        return [(label, curses.A_DIM), (fmt_date(note[field]), attr)]
+        mine, theirs = fmt_date(note[field]), fmt_date(other[field])
+        # compare the displayed values so sub-minute differences don't color
+        attr = style_attr(only_here_style) if mine != theirs else curses.A_DIM
+        return [(label, curses.A_DIM), (mine, attr)]
 
     _put_line(stdscr, x, y,     w, tag_segs("DB", note["db_tags"], other["db_tags"]))
     _put_line(stdscr, x, y + 1, w, tag_segs("MD", note["md_tags"], other["md_tags"]))
