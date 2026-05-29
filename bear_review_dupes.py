@@ -15,10 +15,16 @@ Controls:
   Space   — skip (keep both, move to next pair)
   D       — trash the COPY  (right panel, the " 2" note)
   d       — trash the BASE  (left panel, the original)
+  s       — sync tags COPY → BASE (adds the copy's missing tags to the base)
   ↑ / ↓  — scroll both panels together
   q       — quit
 
+A metadata bar at the top of each panel shows the note's tags as stored in
+the Bear database vs. the tags parsed from its markdown (mismatches are
+highlighted), plus its creation and modification dates.
+
 Deletion calls: bearcli trash <uuid>
+Tag sync calls: bearcli tags add <uuid> <tag>
 
 Usage:
     python3 bear_review_dupes.py
@@ -30,6 +36,7 @@ import subprocess
 import sqlite3
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path.home() / "Library/Group Containers/9K33E3U3T4.net.shinyfrog.bear/Application Data/database.sqlite"
@@ -69,6 +76,62 @@ def normalize(content: str) -> str:
     return "\n".join(collapsed)
 
 
+# Core Data stores timestamps as seconds since 2001-01-01; this offset converts
+# them to the Unix epoch.
+CORE_DATA_EPOCH = 978307200
+
+# Markdown tags: "#tag" / "#nested/tag". Requires a word char right after the
+# "#" (so markdown headings like "# Heading" are not matched) and a word
+# boundary before it (so "url#frag" is not matched). Multi-word "#a b#" tags
+# are not captured.
+_MD_TAG_RE = re.compile(r'(?:(?<=\s)|^)#([\w/][\w/\-]*)')
+
+
+def md_tags(text: str) -> set:
+    """Tags as written inline in the note's markdown."""
+    return set(_MD_TAG_RE.findall(text or ""))
+
+
+def fmt_date(ts) -> str:
+    """Format a Core Data timestamp as a local date/time string."""
+    if ts is None:
+        return "—"
+    try:
+        return datetime.fromtimestamp(ts + CORE_DATA_EPOCH).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError, OverflowError):
+        return "—"
+
+
+def load_db_tags(conn) -> dict:
+    """
+    Return {note_pk: set(tag_title)} by discovering Bear's note↔tag join table
+    (its name, e.g. Z_5TAGS, varies by Bear version).
+    """
+    cur = conn.cursor()
+    cur.execute(
+        r"SELECT name FROM sqlite_master "
+        r"WHERE type='table' AND name LIKE 'Z\_%TAGS' ESCAPE '\'"
+    )
+    join_tables = [r[0] for r in cur.fetchall()]
+
+    result = {}
+    for jt in join_tables:
+        cols = [r[1] for r in cur.execute(f'PRAGMA table_info("{jt}")').fetchall()]
+        note_col = next((c for c in cols if c.endswith("NOTES")), None)
+        tag_col  = next((c for c in cols if c.endswith("TAGS")), None)
+        if not note_col or not tag_col:
+            continue
+        try:
+            q = (f'SELECT j."{note_col}" AS note_pk, t.ZTITLE AS tag '
+                 f'FROM "{jt}" j JOIN ZSFNOTETAG t ON t.Z_PK = j."{tag_col}"')
+            for row in cur.execute(q):
+                if row["tag"]:
+                    result.setdefault(row["note_pk"], set()).add(row["tag"])
+        except sqlite3.Error:
+            continue
+    return result
+
+
 def load_pairs():
     if not DB_PATH.exists():
         print(f"ERROR: Bear database not found at:\n  {DB_PATH}")
@@ -78,21 +141,29 @@ def load_pairs():
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
-        SELECT ZUNIQUEIDENTIFIER as id, ZTITLE as title, ZTEXT as content
+        SELECT Z_PK as pk, ZUNIQUEIDENTIFIER as id, ZTITLE as title, ZTEXT as content,
+               ZCREATIONDATE as ctime, ZMODIFICATIONDATE as mtime
         FROM ZSFNOTE
         WHERE ZTRASHED = 0 AND ZARCHIVED = 0 AND ZENCRYPTED = 0
     """)
     rows = cur.fetchall()
+    db_tags = load_db_tags(conn)
     conn.close()
 
     by_title = {}
     for row in rows:
         title = (row["title"] or "").strip()
+        content = row["content"] or ""
         by_title[title] = {
-            "id":      row["id"],
-            "title":   title,
-            "content": row["content"] or "",
-            "norm":    normalize(row["content"] or ""),
+            "pk":       row["pk"],
+            "id":       row["id"],
+            "title":    title,
+            "content":  content,
+            "norm":     normalize(content),
+            "ctime":    row["ctime"],
+            "mtime":    row["mtime"],
+            "db_tags":  db_tags.get(row["pk"], set()),
+            "md_tags":  md_tags(content),
         }
 
     suffix_re = re.compile(r'^(.+?) (\d+)$')
@@ -125,6 +196,18 @@ def trash(note_id: str) -> bool:
         capture_output=True, text=True
     )
     return result.returncode == 0
+
+
+def add_tags(note_id: str, tags) -> bool:
+    """Add each tag to a note via `bearcli tags add <uuid> <tag>` (won't touch mDate)."""
+    ok = True
+    for tag in tags:
+        result = subprocess.run(
+            ["bearcli", "tags", "add", note_id, tag],
+            capture_output=True, text=True
+        )
+        ok = ok and result.returncode == 0
+    return ok
 
 
 # A "segment" is a (text, style) tuple. A "side" of a logical diff row is a
@@ -336,6 +419,8 @@ C_HILITE  = 6   # yellow — key hints
 C_ADD     = 7   # muted dark-green band — added text
 C_DEL     = 8   # muted dark-red band   — removed text
 
+META_H = 3      # rows in the top metadata bar (DB tags / MD tags / dates)
+
 
 def style_attr(style):
     """Map a diff style to a curses attribute."""
@@ -393,20 +478,69 @@ def draw_panel(stdscr, x, y, w, h, title, lines, scroll, color_title):
             pass
 
 
+def _put_line(stdscr, x, y, w, segments):
+    """Write (text, attr) segments on one row, clipped and padded to `w`."""
+    col = 0
+    for text, attr in segments:
+        if col >= w:
+            break
+        piece = text[: w - col]
+        if piece:
+            try:
+                stdscr.addstr(y, x + col, piece, attr)
+            except curses.error:
+                pass
+            col += len(piece)
+    if col < w:
+        try:
+            stdscr.addstr(y, x + col, " " * (w - col))
+        except curses.error:
+            pass
+
+
+def draw_meta(stdscr, x, y, w, note):
+    """
+    Draw a note's metadata block (3 rows): DB tags, markdown tags, and dates.
+    Tags present in only one of the two sources are highlighted.
+    """
+    db, md = note["db_tags"], note["md_tags"]
+
+    def tag_segs(label, tags, other):
+        segs = [(f"{label} ", curses.color_pair(C_TITLE))]
+        if tags:
+            for t in sorted(tags):
+                attr = curses.color_pair(C_HILITE) if t not in other else curses.A_NORMAL
+                segs.append((f"#{t} ", attr))
+        else:
+            segs.append(("—", curses.A_DIM))
+        return segs
+
+    _put_line(stdscr, x, y,     w, tag_segs("DB", db, md))
+    _put_line(stdscr, x, y + 1, w, tag_segs("MD", md, db))
+    _put_line(stdscr, x, y + 2, w,
+              [(f"created {fmt_date(note['ctime'])}   "
+                f"modified {fmt_date(note['mtime'])}", curses.A_DIM)])
+
+
 def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
 
     half = (w - 1) // 2        # width of each panel
-    content_h = h - 3           # rows for content (minus header + status)
+    right_w = w - half - 1
+    # rows for content (minus metadata bar + panel header + status bar)
+    content_h = max(1, h - META_H - 2)
 
     base, sfx, n = pairs[idx]
     identical = base["norm"] == sfx["norm"]
     badge = "  IDENTICAL  " if identical else "  DIVERGED  "
     badge_color = C_SAME if identical else C_DIFF
 
+    # metadata bar (per-note: base on the left, copy on the right)
+    draw_meta(stdscr, 0, 0, half, base)
+    draw_meta(stdscr, half + 1, 0, right_w, sfx)
+
     # build an aligned, color-coded diff for both panels
-    right_w = w - half - 1
     rows = build_diff(base["content"], sfx["content"])
     left_lines, right_lines = wrap_diff(rows, half, right_w)
 
@@ -415,7 +549,7 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
     scroll = min(scroll, max_scroll)
 
     # left panel
-    draw_panel(stdscr, 0, 0, half, content_h, base["title"], left_lines, scroll, C_TITLE)
+    draw_panel(stdscr, 0, META_H, half, content_h, base["title"], left_lines, scroll, C_TITLE)
 
     # divider
     for row in range(h - 1):
@@ -427,20 +561,20 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
             pass
 
     # right panel
-    draw_panel(stdscr, half + 1, 0, w - half - 1, content_h, sfx["title"], right_lines, scroll, C_TITLE)
+    draw_panel(stdscr, half + 1, META_H, right_w, content_h, sfx["title"], right_lines, scroll, C_TITLE)
 
-    # badge (centred on divider)
+    # badge (centred on divider, on the panel header row)
     badge_x = max(0, half - len(badge) // 2)
     try:
         stdscr.attron(curses.color_pair(badge_color) | curses.A_BOLD)
-        stdscr.addstr(0, badge_x, badge[: w - badge_x])
+        stdscr.addstr(META_H, badge_x, badge[: w - badge_x])
         stdscr.attroff(curses.color_pair(badge_color) | curses.A_BOLD)
     except curses.error:
         pass
 
     # status bar
     progress = f" {idx + 1}/{len(pairs)}  trashed:{trashed_count} "
-    keys     = " [Space] skip   [D] trash COPY   [d] trash BASE   [↑↓] scroll   [q] quit "
+    keys     = " [Space] skip  [D] trash COPY  [d] trash BASE  [s] sync tags→base  [↑↓] scroll  [q] quit "
     bar = (progress + keys).ljust(w)[:w]
     try:
         stdscr.attron(curses.color_pair(C_STATUS) | curses.A_BOLD)
@@ -454,6 +588,19 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
 
 
 # ── main loop ─────────────────────────────────────────────────────────────────
+
+def flash(stdscr, msg, color):
+    """Show a one-line message on the status row and wait for a keypress."""
+    h, w = stdscr.getmaxyx()
+    try:
+        stdscr.attron(curses.color_pair(color) | curses.A_BOLD)
+        stdscr.addstr(h - 1, 0, msg[: w - 1].ljust(w - 1))
+        stdscr.attroff(curses.color_pair(color) | curses.A_BOLD)
+    except curses.error:
+        pass
+    stdscr.refresh()
+    stdscr.getch()
+
 
 def run(stdscr, pairs):
     curses.curs_set(0)
@@ -499,17 +646,7 @@ def run(stdscr, pairs):
                 pairs.pop(idx)
                 scroll = 0
             else:
-                # show error briefly
-                h, w = stdscr.getmaxyx()
-                msg = " bearcli failed — is it installed? "
-                try:
-                    stdscr.attron(curses.color_pair(C_DIFF) | curses.A_BOLD)
-                    stdscr.addstr(h - 1, 0, msg[:w - 1])
-                    stdscr.attroff(curses.color_pair(C_DIFF) | curses.A_BOLD)
-                except curses.error:
-                    pass
-                stdscr.refresh()
-                stdscr.getch()  # wait for keypress
+                flash(stdscr, " bearcli failed — is it installed? ", C_DIFF)
 
         elif key == ord('d'):
             # trash the base (left note)
@@ -519,16 +656,19 @@ def run(stdscr, pairs):
                 pairs.pop(idx)
                 scroll = 0
             else:
-                h, w = stdscr.getmaxyx()
-                msg = " bearcli failed — is it installed? "
-                try:
-                    stdscr.attron(curses.color_pair(C_DIFF) | curses.A_BOLD)
-                    stdscr.addstr(h - 1, 0, msg[:w - 1])
-                    stdscr.attroff(curses.color_pair(C_DIFF) | curses.A_BOLD)
-                except curses.error:
-                    pass
-                stdscr.refresh()
-                stdscr.getch()
+                flash(stdscr, " bearcli failed — is it installed? ", C_DIFF)
+
+        elif key == ord('s'):
+            # sync tags from the copy into the base (union: add the ones it lacks)
+            base, sfx, _ = pairs[idx]
+            missing = sfx["db_tags"] - base["db_tags"]
+            if not missing:
+                flash(stdscr, " base already has all of the copy's tags ", C_HILITE)
+            elif add_tags(base["id"], missing):
+                base["db_tags"] |= missing
+                flash(stdscr, f" synced {len(missing)} tag(s) → base ", C_SAME)
+            else:
+                flash(stdscr, " bearcli tags add failed ", C_DIFF)
 
         elif key in (curses.KEY_UP, ord('k')):
             scroll = max(0, scroll - 1)
