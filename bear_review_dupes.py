@@ -244,6 +244,15 @@ def add_tags(note_id: str, tags) -> bool:
     return ok
 
 
+def tags_to_sync(base: dict, copy: dict) -> set:
+    """
+    Tags to copy from `copy` into `base`: those the copy has in either source
+    (DB or markdown) that the base has in neither. A markdown-only tag on the
+    copy still needs transferring even when neither note carries it as a DB tag.
+    """
+    return (copy["db_tags"] | copy["md_tags"]) - (base["db_tags"] | base["md_tags"])
+
+
 # A "segment" is a (text, style) tuple. A "side" of a logical diff row is a
 # (segments, fill_style) pair: `segments` are drawn left-to-right, then the rest
 # of the panel width is padded using `fill_style` (so whole-line add/remove and
@@ -715,7 +724,7 @@ def run(stdscr, pairs):
             # Consider tags from both sources — a tag in the copy's markdown but
             # not yet indexed in the DB still needs to be transferred.
             base, sfx, _ = pairs[idx]
-            missing = (sfx["db_tags"] | sfx["md_tags"]) - (base["db_tags"] | base["md_tags"])
+            missing = tags_to_sync(base, sfx)
             if not missing:
                 flash(stdscr, " base already has all of the copy's tags ", C_HILITE)
             elif add_tags(base["id"], missing):
