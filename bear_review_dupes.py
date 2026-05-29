@@ -2,6 +2,15 @@
 """
 Interactive side-by-side duplicate reviewer for Bear notes.
 
+The two panels are aligned line-by-line as a diff (matched on a
+whitespace-normalized key so reflowed/whitespace lines stay aligned):
+  green  — text added in the COPY (right panel)
+  red    — text removed from the BASE (left panel)
+  dim    — line is identical except for whitespace (minor change)
+  plain  — unchanged text
+Lines that only changed by a few words highlight just the differing
+words rather than the whole line.
+
 Controls:
   Space   — skip (keep both, move to next pair)
   D       — trash the COPY  (right panel, the " 2" note)
@@ -16,6 +25,7 @@ Usage:
 """
 
 import curses
+import difflib
 import subprocess
 import sqlite3
 import re
@@ -117,18 +127,202 @@ def trash(note_id: str) -> bool:
     return result.returncode == 0
 
 
-def wrap_lines(text: str, width: int) -> list[str]:
-    """Wrap text to fit in `width` columns."""
-    out = []
-    for raw_line in text.splitlines():
-        if not raw_line:
-            out.append("")
-            continue
-        while len(raw_line) > width:
-            out.append(raw_line[:width])
-            raw_line = raw_line[width:]
-        out.append(raw_line)
-    return out
+# A "segment" is a (text, style) tuple. A "side" of a logical diff row is a
+# (segments, fill_style) pair: `segments` are drawn left-to-right, then the rest
+# of the panel width is padded using `fill_style` (so whole-line add/remove and
+# whitespace rows show as a band even when blank).
+#
+# Styles:
+#   "plain" / None — unchanged / context text (no color)
+#   "del"          — removed text (red)            [token-level or whole line]
+#   "add"          — added text (green)            [token-level or whole line]
+#   "ws"           — whitespace-only difference (dim, minor change)
+
+_TOKEN_RE = re.compile(r"\w+|\s+|[^\w\s]")
+
+
+def _norm_key(line: str) -> str:
+    """Whitespace-insensitive key: strip ends, collapse internal runs."""
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def _tokenize(line: str):
+    return _TOKEN_RE.findall(line)
+
+
+def token_diff(left: str, right: str):
+    """
+    Intra-line word/character diff for a pair of changed lines.
+
+    Returns (left_segments, right_segments); only the differing tokens are
+    tagged "del"/"add", shared tokens stay "plain".
+    """
+    lt, rt = _tokenize(left), _tokenize(right)
+    sm = difflib.SequenceMatcher(a=lt, b=rt, autojunk=False)
+
+    lsegs, rsegs = [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        lpart = "".join(lt[i1:i2])
+        rpart = "".join(rt[j1:j2])
+        if tag == "equal":
+            if lpart:
+                lsegs.append((lpart, "plain"))
+            if rpart:
+                rsegs.append((rpart, "plain"))
+        elif tag == "replace":
+            if lpart:
+                lsegs.append((lpart, "del"))
+            if rpart:
+                rsegs.append((rpart, "add"))
+        elif tag == "delete":
+            if lpart:
+                lsegs.append((lpart, "del"))
+        elif tag == "insert":
+            if rpart:
+                rsegs.append((rpart, "add"))
+    return lsegs or [("", "plain")], rsegs or [("", "plain")]
+
+
+# Below this similarity ratio, two lines in a replace block are considered
+# unrelated and shown as a full remove + full add rather than word-diffed.
+_PAIR_THRESHOLD = 0.5
+# Above this many line-pairs, skip the O(n*m) alignment and pair positionally
+# (keeps very large diverged notes responsive).
+_ALIGN_BUDGET = 10000
+
+
+def align_block(lblock, rblock):
+    """
+    Align the lines of a replace block by similarity (not by position), so an
+    inserted/removed line in the middle doesn't shift everything and cause
+    unrelated lines to be word-diffed against each other.
+
+    Returns a list of ops: ("pair", l, r) | ("del", l) | ("add", r).
+    """
+    n, m = len(lblock), len(rblock)
+    if n * m > _ALIGN_BUDGET:
+        # fall back to positional pairing for very large blocks
+        ops = [("pair", lblock[k], rblock[k]) for k in range(min(n, m))]
+        ops += [("del", l) for l in lblock[m:]]
+        ops += [("add", r) for r in rblock[n:]]
+        return ops
+
+    NEG = float("-inf")
+
+    def score(l, r):
+        s = difflib.SequenceMatcher(None, l, r, autojunk=False).ratio()
+        return s if s >= _PAIR_THRESHOLD else NEG
+
+    # Needleman–Wunsch: a gap (unmatched line) scores 0, a match scores its ratio.
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            dp[i][j] = max(
+                dp[i - 1][j - 1] + score(lblock[i - 1], rblock[j - 1]),  # pair
+                dp[i - 1][j],   # left line unmatched (del)
+                dp[i][j - 1],   # right line unmatched (add)
+            )
+
+    # backtrack, preferring a real pair over gaps on ties
+    ops = []
+    i, j = n, m
+    while i > 0 and j > 0:
+        diag = dp[i - 1][j - 1] + score(lblock[i - 1], rblock[j - 1])
+        if diag >= dp[i - 1][j] and diag >= dp[i][j - 1] and diag != NEG:
+            ops.append(("pair", lblock[i - 1], rblock[j - 1]))
+            i, j = i - 1, j - 1
+        elif dp[i - 1][j] >= dp[i][j - 1]:
+            ops.append(("del", lblock[i - 1]))
+            i -= 1
+        else:
+            ops.append(("add", rblock[j - 1]))
+            j -= 1
+    while i > 0:
+        ops.append(("del", lblock[i - 1]))
+        i -= 1
+    while j > 0:
+        ops.append(("add", rblock[j - 1]))
+        j -= 1
+    ops.reverse()
+    return ops
+
+
+def build_diff(left_text: str, right_text: str):
+    """
+    Align the two notes into logical diff rows, matching on a whitespace-
+    normalized key so that whitespace-only or shifted lines line up instead of
+    being reported as separate add/remove.
+
+    Returns a list of (left_side, right_side) where each side is
+    (segments, fill_style).
+    """
+    L = left_text.splitlines()
+    R = right_text.splitlines()
+    sm = difflib.SequenceMatcher(
+        a=[_norm_key(x) for x in L],
+        b=[_norm_key(x) for x in R],
+        autojunk=False,
+    )
+
+    rows = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for a, b in zip(L[i1:i2], R[j1:j2]):
+                if a == b:
+                    rows.append((([(a, "plain")], None), ([(b, "plain")], None)))
+                else:  # same content, whitespace differs → minor change
+                    rows.append((([(a, "ws")], "ws"), ([(b, "ws")], "ws")))
+        elif tag == "replace":
+            for op in align_block(L[i1:i2], R[j1:j2]):
+                if op[0] == "pair":           # similar lines → word-level highlight
+                    lsegs, rsegs = token_diff(op[1], op[2])
+                    rows.append(((lsegs, None), (rsegs, None)))
+                elif op[0] == "del":          # unrelated removed line
+                    rows.append((([(op[1], "del")], "del"), ([], None)))
+                else:                         # unrelated added line
+                    rows.append((([], None), ([(op[1], "add")], "add")))
+        elif tag == "delete":
+            for a in L[i1:i2]:
+                rows.append((([(a, "del")], "del"), ([], None)))
+        elif tag == "insert":
+            for b in R[j1:j2]:
+                rows.append((([], None), ([(b, "add")], "add")))
+    return rows
+
+
+def wrap_segments(segments, width: int):
+    """Wrap (text, style) segments to `width`, returning a list of rows of segments."""
+    rows = [[]]
+    cur = 0
+    for text, style in segments:
+        i = 0
+        while i < len(text):
+            if cur >= width:
+                rows.append([])
+                cur = 0
+            take = min(width - cur, len(text) - i)
+            rows[-1].append((text[i:i + take], style))
+            i += take
+            cur += take
+    return rows
+
+
+def wrap_diff(rows, lwidth: int, rwidth: int):
+    """
+    Wrap each logical diff row, keeping the two panels row-aligned.
+
+    Returns (left_disp, right_disp); each element is (segments, fill_style).
+    """
+    left_disp, right_disp = [], []
+    for (lsegs, lfill), (rsegs, rfill) in rows:
+        lrows = wrap_segments(lsegs, lwidth)
+        rrows = wrap_segments(rsegs, rwidth)
+        n = max(len(lrows), len(rrows))
+        lrows += [[] for _ in range(n - len(lrows))]
+        rrows += [[] for _ in range(n - len(rrows))]
+        left_disp.extend((row, lfill) for row in lrows)
+        right_disp.extend((row, rfill) for row in rrows)
+    return left_disp, right_disp
 
 
 # ── drawing ───────────────────────────────────────────────────────────────────
@@ -139,10 +333,30 @@ C_DIFF    = 3   # red   — diverged badge
 C_STATUS  = 4   # black on white — bottom bar
 C_DIVIDER = 5   # dim   — centre divider
 C_HILITE  = 6   # yellow — key hints
+C_ADD     = 7   # muted dark-green band — added text
+C_DEL     = 8   # muted dark-red band   — removed text
+
+
+def style_attr(style):
+    """Map a diff style to a curses attribute."""
+    if style == "add":
+        return curses.color_pair(C_ADD)
+    if style == "del":
+        return curses.color_pair(C_DEL)
+    if style == "ws":
+        return curses.A_DIM
+    return curses.A_NORMAL
 
 
 def draw_panel(stdscr, x, y, w, h, title, lines, scroll, color_title):
-    """Draw one panel: header + scrolled content."""
+    """
+    Draw one panel: header + scrolled content.
+
+    `lines` is a list of (segments, fill_style) tuples, where `segments` is a
+    list of (text, style) pieces. Each piece is colored by its style (green for
+    "add", red for "del", dim for "ws"); the row's remaining width is padded
+    using `fill_style` so whole-line changes show as a band.
+    """
     # header
     header = f" {title} "
     header = header[:w]
@@ -152,12 +366,24 @@ def draw_panel(stdscr, x, y, w, h, title, lines, scroll, color_title):
 
     # content
     visible = lines[scroll: scroll + h]
-    for i, line in enumerate(visible):
-        line = line[:w]
-        try:
-            stdscr.addstr(y + 1 + i, x, line.ljust(w)[:w])
-        except curses.error:
-            pass
+    for i, (segments, fill) in enumerate(visible):
+        row = y + 1 + i
+        col = 0
+        for text, style in segments:
+            if col >= w:
+                break
+            piece = text[: w - col]
+            if piece:
+                try:
+                    stdscr.addstr(row, x + col, piece, style_attr(style))
+                except curses.error:
+                    pass
+                col += len(piece)
+        if col < w:  # pad the rest of the row (colored band for full-line changes)
+            try:
+                stdscr.addstr(row, x + col, " " * (w - col), style_attr(fill))
+            except curses.error:
+                pass
 
     # blank remaining rows
     for i in range(len(visible), h):
@@ -179,12 +405,13 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
     badge = "  IDENTICAL  " if identical else "  DIVERGED  "
     badge_color = C_SAME if identical else C_DIFF
 
-    # wrap content for each panel
-    left_lines  = wrap_lines(base["content"], half)
-    right_lines = wrap_lines(sfx["content"],  half)
+    # build an aligned, color-coded diff for both panels
+    right_w = w - half - 1
+    rows = build_diff(base["content"], sfx["content"])
+    left_lines, right_lines = wrap_diff(rows, half, right_w)
 
-    # clamp scroll
-    max_scroll = max(0, max(len(left_lines), len(right_lines)) - content_h)
+    # clamp scroll (panels are row-aligned, so lengths match)
+    max_scroll = max(0, len(left_lines) - content_h)
     scroll = min(scroll, max_scroll)
 
     # left panel
@@ -239,6 +466,14 @@ def run(stdscr, pairs):
     curses.init_pair(C_STATUS,  curses.COLOR_BLACK,   curses.COLOR_WHITE)
     curses.init_pair(C_DIVIDER, curses.COLOR_WHITE,   -1)
     curses.init_pair(C_HILITE,  curses.COLOR_YELLOW,  -1)
+    # muted, darker diff bands when the terminal has a 256-color palette;
+    # otherwise fall back to the basic 8-color set.
+    if curses.COLORS >= 256:
+        curses.init_pair(C_ADD, 252, 22)   # light grey on dark green
+        curses.init_pair(C_DEL, 252, 52)   # light grey on dark red
+    else:
+        curses.init_pair(C_ADD, curses.COLOR_BLACK, curses.COLOR_GREEN)
+        curses.init_pair(C_DEL, curses.COLOR_WHITE, curses.COLOR_RED)
 
     idx = 0
     scroll = 0
