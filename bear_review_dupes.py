@@ -581,11 +581,11 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
     # right panel
     draw_panel(stdscr, half + 1, panel_y, right_w, content_h, sfx["title"], right_lines, scroll, C_TITLE)
 
-    # badge (centred on divider, on the panel header row)
+    # badge (centred on divider, on the delimiter row so it doesn't cover a title)
     badge_x = max(0, half - len(badge) // 2)
     try:
         stdscr.attron(curses.color_pair(badge_color) | curses.A_BOLD)
-        stdscr.addstr(panel_y, badge_x, badge[: w - badge_x])
+        stdscr.addstr(sep_y, badge_x, badge[: w - badge_x])
         stdscr.attroff(curses.color_pair(badge_color) | curses.A_BOLD)
     except curses.error:
         pass
