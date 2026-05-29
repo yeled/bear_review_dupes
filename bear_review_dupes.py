@@ -498,25 +498,27 @@ def _put_line(stdscr, x, y, w, segments):
             pass
 
 
-def draw_meta(stdscr, x, y, w, note):
+def draw_meta(stdscr, x, y, w, note, other, only_here_style):
     """
     Draw a note's metadata block (3 rows): DB tags, markdown tags, and dates.
-    Tags present in only one of the two sources are highlighted.
-    """
-    db, md = note["db_tags"], note["md_tags"]
 
-    def tag_segs(label, tags, other):
+    Tags are diff-colored against the other note (compared source-for-source:
+    DB↔DB, MD↔MD). A tag this note has that the other lacks is drawn with
+    `only_here_style` ("del" on the base, "add" on the copy); shared tags are
+    plain.
+    """
+    def tag_segs(label, tags, other_tags):
         segs = [(f"{label} ", curses.color_pair(C_TITLE))]
         if tags:
             for t in sorted(tags):
-                attr = curses.color_pair(C_HILITE) if t not in other else curses.A_NORMAL
+                attr = style_attr(only_here_style) if t not in other_tags else curses.A_NORMAL
                 segs.append((f"#{t} ", attr))
         else:
             segs.append(("—", curses.A_DIM))
         return segs
 
-    _put_line(stdscr, x, y,     w, tag_segs("DB", db, md))
-    _put_line(stdscr, x, y + 1, w, tag_segs("MD", md, db))
+    _put_line(stdscr, x, y,     w, tag_segs("DB", note["db_tags"], other["db_tags"]))
+    _put_line(stdscr, x, y + 1, w, tag_segs("MD", note["md_tags"], other["md_tags"]))
     _put_line(stdscr, x, y + 2, w,
               [(f"created {fmt_date(note['ctime'])}   "
                 f"modified {fmt_date(note['mtime'])}", curses.A_DIM)])
@@ -528,17 +530,27 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
 
     half = (w - 1) // 2        # width of each panel
     right_w = w - half - 1
-    # rows for content (minus metadata bar + panel header + status bar)
-    content_h = max(1, h - META_H - 2)
+    sep_y = META_H              # row of the horizontal delimiter under the bar
+    panel_y = META_H + 1        # row of the panel header (titles)
+    # rows for content (minus metadata bar + delimiter + panel header + status bar)
+    content_h = max(1, h - META_H - 3)
 
     base, sfx, n = pairs[idx]
     identical = base["norm"] == sfx["norm"]
     badge = "  IDENTICAL  " if identical else "  DIVERGED  "
     badge_color = C_SAME if identical else C_DIFF
 
-    # metadata bar (per-note: base on the left, copy on the right)
-    draw_meta(stdscr, 0, 0, half, base)
-    draw_meta(stdscr, half + 1, 0, right_w, sfx)
+    # metadata bar (per-note: base on the left, copy on the right; tags diff-colored)
+    draw_meta(stdscr, 0, 0, half, base, sfx, "del")
+    draw_meta(stdscr, half + 1, 0, right_w, sfx, base, "add")
+
+    # horizontal delimiter marking the end of the metadata bar
+    try:
+        stdscr.attron(curses.color_pair(C_DIVIDER))
+        stdscr.addstr(sep_y, 0, "─" * w)
+        stdscr.attroff(curses.color_pair(C_DIVIDER))
+    except curses.error:
+        pass
 
     # build an aligned, color-coded diff for both panels
     rows = build_diff(base["content"], sfx["content"])
@@ -549,25 +561,25 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
     scroll = min(scroll, max_scroll)
 
     # left panel
-    draw_panel(stdscr, 0, META_H, half, content_h, base["title"], left_lines, scroll, C_TITLE)
+    draw_panel(stdscr, 0, panel_y, half, content_h, base["title"], left_lines, scroll, C_TITLE)
 
-    # divider
+    # divider (── crosses the delimiter row as ┼)
     for row in range(h - 1):
         try:
             stdscr.attron(curses.color_pair(C_DIVIDER))
-            stdscr.addch(row, half, "│")
+            stdscr.addch(row, half, "┼" if row == sep_y else "│")
             stdscr.attroff(curses.color_pair(C_DIVIDER))
         except curses.error:
             pass
 
     # right panel
-    draw_panel(stdscr, half + 1, META_H, right_w, content_h, sfx["title"], right_lines, scroll, C_TITLE)
+    draw_panel(stdscr, half + 1, panel_y, right_w, content_h, sfx["title"], right_lines, scroll, C_TITLE)
 
     # badge (centred on divider, on the panel header row)
     badge_x = max(0, half - len(badge) // 2)
     try:
         stdscr.attron(curses.color_pair(badge_color) | curses.A_BOLD)
-        stdscr.addstr(META_H, badge_x, badge[: w - badge_x])
+        stdscr.addstr(panel_y, badge_x, badge[: w - badge_x])
         stdscr.attroff(curses.color_pair(badge_color) | curses.A_BOLD)
     except curses.error:
         pass
