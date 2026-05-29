@@ -132,6 +132,29 @@ def load_db_tags(conn) -> dict:
     return result
 
 
+# Per-note columns, shared by the initial load and single-note reloads.
+_NOTE_COLUMNS = (
+    "Z_PK as pk, ZUNIQUEIDENTIFIER as id, ZTITLE as title, ZTEXT as content, "
+    "ZCREATIONDATE as ctime, ZMODIFICATIONDATE as mtime"
+)
+
+
+def _build_note(row, db_tags_for_pk: set) -> dict:
+    """Assemble the in-memory note record from a DB row and its DB tag set."""
+    content = row["content"] or ""
+    return {
+        "pk":       row["pk"],
+        "id":       row["id"],
+        "title":    (row["title"] or "").strip(),
+        "content":  content,
+        "norm":     normalize(content),
+        "ctime":    row["ctime"],
+        "mtime":    row["mtime"],
+        "db_tags":  db_tags_for_pk,
+        "md_tags":  md_tags(content),
+    }
+
+
 def load_pairs():
     if not DB_PATH.exists():
         print(f"ERROR: Bear database not found at:\n  {DB_PATH}")
@@ -140,31 +163,18 @@ def load_pairs():
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute("""
-        SELECT Z_PK as pk, ZUNIQUEIDENTIFIER as id, ZTITLE as title, ZTEXT as content,
-               ZCREATIONDATE as ctime, ZMODIFICATIONDATE as mtime
-        FROM ZSFNOTE
-        WHERE ZTRASHED = 0 AND ZARCHIVED = 0 AND ZENCRYPTED = 0
-    """)
+    cur.execute(
+        f"SELECT {_NOTE_COLUMNS} FROM ZSFNOTE "
+        f"WHERE ZTRASHED = 0 AND ZARCHIVED = 0 AND ZENCRYPTED = 0"
+    )
     rows = cur.fetchall()
     db_tags = load_db_tags(conn)
     conn.close()
 
     by_title = {}
     for row in rows:
-        title = (row["title"] or "").strip()
-        content = row["content"] or ""
-        by_title[title] = {
-            "pk":       row["pk"],
-            "id":       row["id"],
-            "title":    title,
-            "content":  content,
-            "norm":     normalize(content),
-            "ctime":    row["ctime"],
-            "mtime":    row["mtime"],
-            "db_tags":  db_tags.get(row["pk"], set()),
-            "md_tags":  md_tags(content),
-        }
+        note = _build_note(row, db_tags.get(row["pk"], set()))
+        by_title[note["title"]] = note
 
     suffix_re = re.compile(r'^(.+?) (\d+)$')
     pairs = []
@@ -186,6 +196,30 @@ def load_pairs():
 
     pairs.sort(key=sort_key)
     return pairs
+
+
+def reload_note(note: dict) -> None:
+    """
+    Re-read a single note from Bear's DB and refresh it in place.
+
+    Called after a mutation (e.g. a tag sync) so the metadata bar, body diff
+    and IDENTICAL/DIVERGED badge — all recomputed each draw from these fields —
+    reflect what's actually in the database rather than an optimistic patch.
+    The note dict is updated in place so the references held in `pairs` stay
+    valid.
+    """
+    if not DB_PATH.exists():
+        return
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            f"SELECT {_NOTE_COLUMNS} FROM ZSFNOTE WHERE Z_PK = ?", (note["pk"],)
+        ).fetchone()
+        if row is not None:
+            note.update(_build_note(row, load_db_tags(conn).get(row["pk"], set())))
+    finally:
+        conn.close()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -685,7 +719,9 @@ def run(stdscr, pairs):
             if not missing:
                 flash(stdscr, " base already has all of the copy's tags ", C_HILITE)
             elif add_tags(base["id"], missing):
-                base["db_tags"] |= missing
+                # re-read from the DB so the tag rows, body diff and badge all
+                # reflect ground truth (incl. where bearcli placed the tags)
+                reload_note(base)
                 flash(stdscr, f" synced {len(missing)} tag(s) → base ", C_SAME)
             else:
                 flash(stdscr, " bearcli tags add failed ", C_DIFF)
