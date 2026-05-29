@@ -517,11 +517,15 @@ def draw_meta(stdscr, x, y, w, note, other, only_here_style):
             segs.append(("—", curses.A_DIM))
         return segs
 
+    def date_segs(label, field):
+        attr = style_attr(only_here_style) if note[field] != other[field] else curses.A_DIM
+        return [(label, curses.A_DIM), (fmt_date(note[field]), attr)]
+
     _put_line(stdscr, x, y,     w, tag_segs("DB", note["db_tags"], other["db_tags"]))
     _put_line(stdscr, x, y + 1, w, tag_segs("MD", note["md_tags"], other["md_tags"]))
     _put_line(stdscr, x, y + 2, w,
-              [(f"created {fmt_date(note['ctime'])}   "
-                f"modified {fmt_date(note['mtime'])}", curses.A_DIM)])
+              date_segs("created ", "ctime") + [("   ", curses.A_DIM)]
+              + date_segs("modified ", "mtime"))
 
 
 def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
