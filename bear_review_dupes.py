@@ -626,7 +626,7 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
 
     # status bar
     progress = f" {idx + 1}/{len(pairs)}  trashed:{trashed_count} "
-    keys     = " [Space] skip  [D] trash COPY  [d] trash BASE  [s] sync tags→base  [↑↓] scroll  [q] quit "
+    keys     = " [Space] skip  [D] trash COPY  [d] trash BASE  [s] sync tags→base  [r] reload  [↑↓] scroll  [q] quit "
     bar = (progress + keys).ljust(w)[:w]
     try:
         stdscr.attron(curses.color_pair(C_STATUS) | curses.A_BOLD)
@@ -719,12 +719,22 @@ def run(stdscr, pairs):
             if not missing:
                 flash(stdscr, " base already has all of the copy's tags ", C_HILITE)
             elif add_tags(base["id"], missing):
-                # re-read from the DB so the tag rows, body diff and badge all
-                # reflect ground truth (incl. where bearcli placed the tags)
-                reload_note(base)
+                # bearcli adds the DB tag asynchronously (Bear's DB is in WAL
+                # mode), so an immediate re-read races ahead of the write and
+                # sees nothing. add_tags only touches DB tags (it preserves
+                # mDate, i.e. doesn't rewrite the body), so reflect exactly that
+                # in memory now; press [r] to re-read ground truth once Bear has
+                # caught up.
+                base["db_tags"] |= missing
                 flash(stdscr, f" synced {len(missing)} tag(s) → base ", C_SAME)
             else:
                 flash(stdscr, " bearcli tags add failed ", C_DIFF)
+
+        elif key in (ord('r'), ord('R')):
+            # force a ground-truth re-read of the current pair from Bear's DB
+            base, sfx, _ = pairs[idx]
+            reload_note(base)
+            reload_note(sfx)
 
         elif key in (curses.KEY_UP, ord('k')):
             scroll = max(0, scroll - 1)
