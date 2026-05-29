@@ -2,6 +2,11 @@
 """
 Interactive side-by-side duplicate reviewer for Bear notes.
 
+The two panels are aligned line-by-line as a diff:
+  green  — lines added in the COPY (right panel)
+  red    — lines removed from the BASE (left panel)
+  plain  — unchanged lines
+
 Controls:
   Space   — skip (keep both, move to next pair)
   D       — trash the COPY  (right panel, the " 2" note)
@@ -16,6 +21,7 @@ Usage:
 """
 
 import curses
+import difflib
 import subprocess
 import sqlite3
 import re
@@ -117,18 +123,70 @@ def trash(note_id: str) -> bool:
     return result.returncode == 0
 
 
-def wrap_lines(text: str, width: int) -> list[str]:
-    """Wrap text to fit in `width` columns."""
+def wrap_one(line: str, width: int) -> list[str]:
+    """Wrap a single line to fit in `width` columns (at least one row)."""
+    if not line:
+        return [""]
     out = []
-    for raw_line in text.splitlines():
-        if not raw_line:
-            out.append("")
-            continue
-        while len(raw_line) > width:
-            out.append(raw_line[:width])
-            raw_line = raw_line[width:]
-        out.append(raw_line)
+    while len(line) > width:
+        out.append(line[:width])
+        line = line[width:]
+    out.append(line)
     return out
+
+
+def build_diff_rows(left_text: str, right_text: str):
+    """
+    Align the two notes line-by-line.
+
+    Returns a list of (left_line | None, right_line | None, left_tag, right_tag)
+    where tag is one of: "eq" (unchanged), "del" (removed, left only),
+    "add" (added, right only), or None (blank filler).
+    """
+    left_src  = left_text.splitlines()
+    right_src = right_text.splitlines()
+    sm = difflib.SequenceMatcher(a=left_src, b=right_src, autojunk=False)
+
+    rows = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for l, r in zip(left_src[i1:i2], right_src[j1:j2]):
+                rows.append((l, r, "eq", "eq"))
+        elif tag == "replace":
+            lblock = left_src[i1:i2]
+            rblock = right_src[j1:j2]
+            for k in range(max(len(lblock), len(rblock))):
+                l = lblock[k] if k < len(lblock) else None
+                r = rblock[k] if k < len(rblock) else None
+                rows.append((l, r,
+                             "del" if l is not None else None,
+                             "add" if r is not None else None))
+        elif tag == "delete":
+            for l in left_src[i1:i2]:
+                rows.append((l, None, "del", None))
+        elif tag == "insert":
+            for r in right_src[j1:j2]:
+                rows.append((None, r, None, "add"))
+    return rows
+
+
+def wrap_diff_rows(rows, lwidth: int, rwidth: int):
+    """
+    Turn aligned diff rows into per-panel display lines, keeping the two
+    panels row-aligned after wrapping.
+
+    Returns (left_lines, right_lines) where each element is (text, tag).
+    """
+    left_disp, right_disp = [], []
+    for l, r, ltag, rtag in rows:
+        lw = wrap_one(l, lwidth) if l is not None else [""]
+        rw = wrap_one(r, rwidth) if r is not None else [""]
+        n = max(len(lw), len(rw))
+        lw += [""] * (n - len(lw))
+        rw += [""] * (n - len(rw))
+        left_disp.extend((x, ltag) for x in lw)
+        right_disp.extend((x, rtag) for x in rw)
+    return left_disp, right_disp
 
 
 # ── drawing ───────────────────────────────────────────────────────────────────
@@ -139,10 +197,23 @@ C_DIFF    = 3   # red   — diverged badge
 C_STATUS  = 4   # black on white — bottom bar
 C_DIVIDER = 5   # dim   — centre divider
 C_HILITE  = 6   # yellow — key hints
+C_ADD     = 7   # green on dark — added line (right panel)
+C_DEL     = 8   # red on dark   — removed line (left panel)
+
+# diff tag → curses color pair
+TAG_COLOR = {
+    "add": C_ADD,
+    "del": C_DEL,
+}
 
 
 def draw_panel(stdscr, x, y, w, h, title, lines, scroll, color_title):
-    """Draw one panel: header + scrolled content."""
+    """
+    Draw one panel: header + scrolled content.
+
+    `lines` is a list of (text, tag) tuples; the tag selects a diff color
+    (green for "add", red for "del"), with unchanged lines drawn plainly.
+    """
     # header
     header = f" {title} "
     header = header[:w]
@@ -152,10 +223,13 @@ def draw_panel(stdscr, x, y, w, h, title, lines, scroll, color_title):
 
     # content
     visible = lines[scroll: scroll + h]
-    for i, line in enumerate(visible):
-        line = line[:w]
+    for i, (line, tag) in enumerate(visible):
+        pair = TAG_COLOR.get(tag)
+        attr = (curses.color_pair(pair) | curses.A_BOLD) if pair else 0
+        # pad the whole row so the diff color fills the panel width
+        text = line[:w].ljust(w)[:w]
         try:
-            stdscr.addstr(y + 1 + i, x, line.ljust(w)[:w])
+            stdscr.addstr(y + 1 + i, x, text, attr)
         except curses.error:
             pass
 
@@ -179,12 +253,13 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
     badge = "  IDENTICAL  " if identical else "  DIVERGED  "
     badge_color = C_SAME if identical else C_DIFF
 
-    # wrap content for each panel
-    left_lines  = wrap_lines(base["content"], half)
-    right_lines = wrap_lines(sfx["content"],  half)
+    # build an aligned, color-coded diff for both panels
+    right_w = w - half - 1
+    rows = build_diff_rows(base["content"], sfx["content"])
+    left_lines, right_lines = wrap_diff_rows(rows, half, right_w)
 
-    # clamp scroll
-    max_scroll = max(0, max(len(left_lines), len(right_lines)) - content_h)
+    # clamp scroll (panels are row-aligned, so lengths match)
+    max_scroll = max(0, len(left_lines) - content_h)
     scroll = min(scroll, max_scroll)
 
     # left panel
@@ -239,6 +314,8 @@ def run(stdscr, pairs):
     curses.init_pair(C_STATUS,  curses.COLOR_BLACK,   curses.COLOR_WHITE)
     curses.init_pair(C_DIVIDER, curses.COLOR_WHITE,   -1)
     curses.init_pair(C_HILITE,  curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_ADD,     curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_DEL,     curses.COLOR_RED,     -1)
 
     idx = 0
     scroll = 0
