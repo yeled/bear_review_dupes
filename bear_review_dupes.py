@@ -2,10 +2,14 @@
 """
 Interactive side-by-side duplicate reviewer for Bear notes.
 
-The two panels are aligned line-by-line as a diff:
-  green  — lines added in the COPY (right panel)
-  red    — lines removed from the BASE (left panel)
-  plain  — unchanged lines
+The two panels are aligned line-by-line as a diff (matched on a
+whitespace-normalized key so reflowed/whitespace lines stay aligned):
+  green  — text added in the COPY (right panel)
+  red    — text removed from the BASE (left panel)
+  dim    — line is identical except for whitespace (minor change)
+  plain  — unchanged text
+Lines that only changed by a few words highlight just the differing
+words rather than the whole line.
 
 Controls:
   Space   — skip (keep both, move to next pair)
@@ -123,69 +127,138 @@ def trash(note_id: str) -> bool:
     return result.returncode == 0
 
 
-def wrap_one(line: str, width: int) -> list[str]:
-    """Wrap a single line to fit in `width` columns (at least one row)."""
-    if not line:
-        return [""]
-    out = []
-    while len(line) > width:
-        out.append(line[:width])
-        line = line[width:]
-    out.append(line)
-    return out
+# A "segment" is a (text, style) tuple. A "side" of a logical diff row is a
+# (segments, fill_style) pair: `segments` are drawn left-to-right, then the rest
+# of the panel width is padded using `fill_style` (so whole-line add/remove and
+# whitespace rows show as a band even when blank).
+#
+# Styles:
+#   "plain" / None — unchanged / context text (no color)
+#   "del"          — removed text (red)            [token-level or whole line]
+#   "add"          — added text (green)            [token-level or whole line]
+#   "ws"           — whitespace-only difference (dim, minor change)
+
+_TOKEN_RE = re.compile(r"\w+|\s+|[^\w\s]")
 
 
-def build_diff_rows(left_text: str, right_text: str):
+def _norm_key(line: str) -> str:
+    """Whitespace-insensitive key: strip ends, collapse internal runs."""
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def _tokenize(line: str):
+    return _TOKEN_RE.findall(line)
+
+
+def token_diff(left: str, right: str):
     """
-    Align the two notes line-by-line.
+    Intra-line word/character diff for a pair of changed lines.
 
-    Returns a list of (left_line | None, right_line | None, left_tag, right_tag)
-    where tag is one of: "eq" (unchanged), "del" (removed, left only),
-    "add" (added, right only), or None (blank filler).
+    Returns (left_segments, right_segments); only the differing tokens are
+    tagged "del"/"add", shared tokens stay "plain".
     """
-    left_src  = left_text.splitlines()
-    right_src = right_text.splitlines()
-    sm = difflib.SequenceMatcher(a=left_src, b=right_src, autojunk=False)
+    lt, rt = _tokenize(left), _tokenize(right)
+    sm = difflib.SequenceMatcher(a=lt, b=rt, autojunk=False)
+
+    lsegs, rsegs = [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        lpart = "".join(lt[i1:i2])
+        rpart = "".join(rt[j1:j2])
+        if tag == "equal":
+            if lpart:
+                lsegs.append((lpart, "plain"))
+            if rpart:
+                rsegs.append((rpart, "plain"))
+        elif tag == "replace":
+            if lpart:
+                lsegs.append((lpart, "del"))
+            if rpart:
+                rsegs.append((rpart, "add"))
+        elif tag == "delete":
+            if lpart:
+                lsegs.append((lpart, "del"))
+        elif tag == "insert":
+            if rpart:
+                rsegs.append((rpart, "add"))
+    return lsegs or [("", "plain")], rsegs or [("", "plain")]
+
+
+def build_diff(left_text: str, right_text: str):
+    """
+    Align the two notes into logical diff rows, matching on a whitespace-
+    normalized key so that whitespace-only or shifted lines line up instead of
+    being reported as separate add/remove.
+
+    Returns a list of (left_side, right_side) where each side is
+    (segments, fill_style).
+    """
+    L = left_text.splitlines()
+    R = right_text.splitlines()
+    sm = difflib.SequenceMatcher(
+        a=[_norm_key(x) for x in L],
+        b=[_norm_key(x) for x in R],
+        autojunk=False,
+    )
 
     rows = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
-            for l, r in zip(left_src[i1:i2], right_src[j1:j2]):
-                rows.append((l, r, "eq", "eq"))
+            for a, b in zip(L[i1:i2], R[j1:j2]):
+                if a == b:
+                    rows.append((([(a, "plain")], None), ([(b, "plain")], None)))
+                else:  # same content, whitespace differs → minor change
+                    rows.append((([(a, "ws")], "ws"), ([(b, "ws")], "ws")))
         elif tag == "replace":
-            lblock = left_src[i1:i2]
-            rblock = right_src[j1:j2]
-            for k in range(max(len(lblock), len(rblock))):
-                l = lblock[k] if k < len(lblock) else None
-                r = rblock[k] if k < len(rblock) else None
-                rows.append((l, r,
-                             "del" if l is not None else None,
-                             "add" if r is not None else None))
+            lblock, rblock = L[i1:i2], R[j1:j2]
+            n = min(len(lblock), len(rblock))
+            for k in range(n):  # paired lines → word-level highlight
+                lsegs, rsegs = token_diff(lblock[k], rblock[k])
+                rows.append(((lsegs, None), (rsegs, None)))
+            for k in range(n, len(lblock)):  # leftover removed lines
+                rows.append((([(lblock[k], "del")], "del"), ([], None)))
+            for k in range(n, len(rblock)):  # leftover added lines
+                rows.append((([], None), ([(rblock[k], "add")], "add")))
         elif tag == "delete":
-            for l in left_src[i1:i2]:
-                rows.append((l, None, "del", None))
+            for a in L[i1:i2]:
+                rows.append((([(a, "del")], "del"), ([], None)))
         elif tag == "insert":
-            for r in right_src[j1:j2]:
-                rows.append((None, r, None, "add"))
+            for b in R[j1:j2]:
+                rows.append((([], None), ([(b, "add")], "add")))
     return rows
 
 
-def wrap_diff_rows(rows, lwidth: int, rwidth: int):
-    """
-    Turn aligned diff rows into per-panel display lines, keeping the two
-    panels row-aligned after wrapping.
+def wrap_segments(segments, width: int):
+    """Wrap (text, style) segments to `width`, returning a list of rows of segments."""
+    rows = [[]]
+    cur = 0
+    for text, style in segments:
+        i = 0
+        while i < len(text):
+            if cur >= width:
+                rows.append([])
+                cur = 0
+            take = min(width - cur, len(text) - i)
+            rows[-1].append((text[i:i + take], style))
+            i += take
+            cur += take
+    return rows
 
-    Returns (left_lines, right_lines) where each element is (text, tag).
+
+def wrap_diff(rows, lwidth: int, rwidth: int):
+    """
+    Wrap each logical diff row, keeping the two panels row-aligned.
+
+    Returns (left_disp, right_disp); each element is (segments, fill_style).
     """
     left_disp, right_disp = [], []
-    for l, r, ltag, rtag in rows:
-        lw = wrap_one(l, lwidth) if l is not None else [""]
-        rw = wrap_one(r, rwidth) if r is not None else [""]
-        n = max(len(lw), len(rw))
-        lw += [""] * (n - len(lw))
-        rw += [""] * (n - len(rw))
-        left_disp.extend((x, ltag) for x in lw)
-        right_disp.extend((x, rtag) for x in rw)
+    for (lsegs, lfill), (rsegs, rfill) in rows:
+        lrows = wrap_segments(lsegs, lwidth)
+        rrows = wrap_segments(rsegs, rwidth)
+        n = max(len(lrows), len(rrows))
+        lrows += [[] for _ in range(n - len(lrows))]
+        rrows += [[] for _ in range(n - len(rrows))]
+        left_disp.extend((row, lfill) for row in lrows)
+        right_disp.extend((row, rfill) for row in rrows)
     return left_disp, right_disp
 
 
@@ -197,22 +270,29 @@ C_DIFF    = 3   # red   — diverged badge
 C_STATUS  = 4   # black on white — bottom bar
 C_DIVIDER = 5   # dim   — centre divider
 C_HILITE  = 6   # yellow — key hints
-C_ADD     = 7   # green on dark — added line (right panel)
-C_DEL     = 8   # red on dark   — removed line (left panel)
+C_ADD     = 7   # black on green — added text
+C_DEL     = 8   # white on red   — removed text
 
-# diff tag → curses color pair
-TAG_COLOR = {
-    "add": C_ADD,
-    "del": C_DEL,
-}
+
+def style_attr(style):
+    """Map a diff style to a curses attribute."""
+    if style == "add":
+        return curses.color_pair(C_ADD) | curses.A_BOLD
+    if style == "del":
+        return curses.color_pair(C_DEL) | curses.A_BOLD
+    if style == "ws":
+        return curses.A_DIM
+    return curses.A_NORMAL
 
 
 def draw_panel(stdscr, x, y, w, h, title, lines, scroll, color_title):
     """
     Draw one panel: header + scrolled content.
 
-    `lines` is a list of (text, tag) tuples; the tag selects a diff color
-    (green for "add", red for "del"), with unchanged lines drawn plainly.
+    `lines` is a list of (segments, fill_style) tuples, where `segments` is a
+    list of (text, style) pieces. Each piece is colored by its style (green for
+    "add", red for "del", dim for "ws"); the row's remaining width is padded
+    using `fill_style` so whole-line changes show as a band.
     """
     # header
     header = f" {title} "
@@ -223,15 +303,24 @@ def draw_panel(stdscr, x, y, w, h, title, lines, scroll, color_title):
 
     # content
     visible = lines[scroll: scroll + h]
-    for i, (line, tag) in enumerate(visible):
-        pair = TAG_COLOR.get(tag)
-        attr = (curses.color_pair(pair) | curses.A_BOLD) if pair else 0
-        # pad the whole row so the diff color fills the panel width
-        text = line[:w].ljust(w)[:w]
-        try:
-            stdscr.addstr(y + 1 + i, x, text, attr)
-        except curses.error:
-            pass
+    for i, (segments, fill) in enumerate(visible):
+        row = y + 1 + i
+        col = 0
+        for text, style in segments:
+            if col >= w:
+                break
+            piece = text[: w - col]
+            if piece:
+                try:
+                    stdscr.addstr(row, x + col, piece, style_attr(style))
+                except curses.error:
+                    pass
+                col += len(piece)
+        if col < w:  # pad the rest of the row (colored band for full-line changes)
+            try:
+                stdscr.addstr(row, x + col, " " * (w - col), style_attr(fill))
+            except curses.error:
+                pass
 
     # blank remaining rows
     for i in range(len(visible), h):
@@ -255,8 +344,8 @@ def draw_screen(stdscr, pairs, idx, scroll, trashed_count):
 
     # build an aligned, color-coded diff for both panels
     right_w = w - half - 1
-    rows = build_diff_rows(base["content"], sfx["content"])
-    left_lines, right_lines = wrap_diff_rows(rows, half, right_w)
+    rows = build_diff(base["content"], sfx["content"])
+    left_lines, right_lines = wrap_diff(rows, half, right_w)
 
     # clamp scroll (panels are row-aligned, so lengths match)
     max_scroll = max(0, len(left_lines) - content_h)
@@ -314,8 +403,8 @@ def run(stdscr, pairs):
     curses.init_pair(C_STATUS,  curses.COLOR_BLACK,   curses.COLOR_WHITE)
     curses.init_pair(C_DIVIDER, curses.COLOR_WHITE,   -1)
     curses.init_pair(C_HILITE,  curses.COLOR_YELLOW,  -1)
-    curses.init_pair(C_ADD,     curses.COLOR_GREEN,   -1)
-    curses.init_pair(C_DEL,     curses.COLOR_RED,     -1)
+    curses.init_pair(C_ADD,     curses.COLOR_BLACK,   curses.COLOR_GREEN)
+    curses.init_pair(C_DEL,     curses.COLOR_WHITE,   curses.COLOR_RED)
 
     idx = 0
     scroll = 0
