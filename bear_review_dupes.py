@@ -183,6 +183,70 @@ def token_diff(left: str, right: str):
     return lsegs or [("", "plain")], rsegs or [("", "plain")]
 
 
+# Below this similarity ratio, two lines in a replace block are considered
+# unrelated and shown as a full remove + full add rather than word-diffed.
+_PAIR_THRESHOLD = 0.5
+# Above this many line-pairs, skip the O(n*m) alignment and pair positionally
+# (keeps very large diverged notes responsive).
+_ALIGN_BUDGET = 10000
+
+
+def align_block(lblock, rblock):
+    """
+    Align the lines of a replace block by similarity (not by position), so an
+    inserted/removed line in the middle doesn't shift everything and cause
+    unrelated lines to be word-diffed against each other.
+
+    Returns a list of ops: ("pair", l, r) | ("del", l) | ("add", r).
+    """
+    n, m = len(lblock), len(rblock)
+    if n * m > _ALIGN_BUDGET:
+        # fall back to positional pairing for very large blocks
+        ops = [("pair", lblock[k], rblock[k]) for k in range(min(n, m))]
+        ops += [("del", l) for l in lblock[m:]]
+        ops += [("add", r) for r in rblock[n:]]
+        return ops
+
+    NEG = float("-inf")
+
+    def score(l, r):
+        s = difflib.SequenceMatcher(None, l, r, autojunk=False).ratio()
+        return s if s >= _PAIR_THRESHOLD else NEG
+
+    # Needleman–Wunsch: a gap (unmatched line) scores 0, a match scores its ratio.
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            dp[i][j] = max(
+                dp[i - 1][j - 1] + score(lblock[i - 1], rblock[j - 1]),  # pair
+                dp[i - 1][j],   # left line unmatched (del)
+                dp[i][j - 1],   # right line unmatched (add)
+            )
+
+    # backtrack, preferring a real pair over gaps on ties
+    ops = []
+    i, j = n, m
+    while i > 0 and j > 0:
+        diag = dp[i - 1][j - 1] + score(lblock[i - 1], rblock[j - 1])
+        if diag >= dp[i - 1][j] and diag >= dp[i][j - 1] and diag != NEG:
+            ops.append(("pair", lblock[i - 1], rblock[j - 1]))
+            i, j = i - 1, j - 1
+        elif dp[i - 1][j] >= dp[i][j - 1]:
+            ops.append(("del", lblock[i - 1]))
+            i -= 1
+        else:
+            ops.append(("add", rblock[j - 1]))
+            j -= 1
+    while i > 0:
+        ops.append(("del", lblock[i - 1]))
+        i -= 1
+    while j > 0:
+        ops.append(("add", rblock[j - 1]))
+        j -= 1
+    ops.reverse()
+    return ops
+
+
 def build_diff(left_text: str, right_text: str):
     """
     Align the two notes into logical diff rows, matching on a whitespace-
@@ -209,15 +273,14 @@ def build_diff(left_text: str, right_text: str):
                 else:  # same content, whitespace differs → minor change
                     rows.append((([(a, "ws")], "ws"), ([(b, "ws")], "ws")))
         elif tag == "replace":
-            lblock, rblock = L[i1:i2], R[j1:j2]
-            n = min(len(lblock), len(rblock))
-            for k in range(n):  # paired lines → word-level highlight
-                lsegs, rsegs = token_diff(lblock[k], rblock[k])
-                rows.append(((lsegs, None), (rsegs, None)))
-            for k in range(n, len(lblock)):  # leftover removed lines
-                rows.append((([(lblock[k], "del")], "del"), ([], None)))
-            for k in range(n, len(rblock)):  # leftover added lines
-                rows.append((([], None), ([(rblock[k], "add")], "add")))
+            for op in align_block(L[i1:i2], R[j1:j2]):
+                if op[0] == "pair":           # similar lines → word-level highlight
+                    lsegs, rsegs = token_diff(op[1], op[2])
+                    rows.append(((lsegs, None), (rsegs, None)))
+                elif op[0] == "del":          # unrelated removed line
+                    rows.append((([(op[1], "del")], "del"), ([], None)))
+                else:                         # unrelated added line
+                    rows.append((([], None), ([(op[1], "add")], "add")))
         elif tag == "delete":
             for a in L[i1:i2]:
                 rows.append((([(a, "del")], "del"), ([], None)))
@@ -270,16 +333,16 @@ C_DIFF    = 3   # red   — diverged badge
 C_STATUS  = 4   # black on white — bottom bar
 C_DIVIDER = 5   # dim   — centre divider
 C_HILITE  = 6   # yellow — key hints
-C_ADD     = 7   # black on green — added text
-C_DEL     = 8   # white on red   — removed text
+C_ADD     = 7   # muted dark-green band — added text
+C_DEL     = 8   # muted dark-red band   — removed text
 
 
 def style_attr(style):
     """Map a diff style to a curses attribute."""
     if style == "add":
-        return curses.color_pair(C_ADD) | curses.A_BOLD
+        return curses.color_pair(C_ADD)
     if style == "del":
-        return curses.color_pair(C_DEL) | curses.A_BOLD
+        return curses.color_pair(C_DEL)
     if style == "ws":
         return curses.A_DIM
     return curses.A_NORMAL
@@ -403,8 +466,14 @@ def run(stdscr, pairs):
     curses.init_pair(C_STATUS,  curses.COLOR_BLACK,   curses.COLOR_WHITE)
     curses.init_pair(C_DIVIDER, curses.COLOR_WHITE,   -1)
     curses.init_pair(C_HILITE,  curses.COLOR_YELLOW,  -1)
-    curses.init_pair(C_ADD,     curses.COLOR_BLACK,   curses.COLOR_GREEN)
-    curses.init_pair(C_DEL,     curses.COLOR_WHITE,   curses.COLOR_RED)
+    # muted, darker diff bands when the terminal has a 256-color palette;
+    # otherwise fall back to the basic 8-color set.
+    if curses.COLORS >= 256:
+        curses.init_pair(C_ADD, 252, 22)   # light grey on dark green
+        curses.init_pair(C_DEL, 252, 52)   # light grey on dark red
+    else:
+        curses.init_pair(C_ADD, curses.COLOR_BLACK, curses.COLOR_GREEN)
+        curses.init_pair(C_DEL, curses.COLOR_WHITE, curses.COLOR_RED)
 
     idx = 0
     scroll = 0
